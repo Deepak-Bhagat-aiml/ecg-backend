@@ -23,6 +23,7 @@ EXPLAINABLE AI (v3.1):
 
 import io
 import os
+import gc
 import math
 import logging
 
@@ -357,12 +358,12 @@ def _demo_predict(image_array: np.ndarray) -> dict:
     probs = rng.dirichlet(alpha=[4.0, 1.0, 1.0]).tolist()
     idx   = int(np.argmax(probs))
     return {
-        "verdict":        CLASSES[idx],
+        "verdict":         CLASSES[idx],
         "confidence_pct": round(probs[idx] * 100, 1),
-        "prob_normal":    round(probs[0] * 100, 1),
-        "prob_hyper":     round(probs[1] * 100, 1),
-        "prob_hypo":      round(probs[2] * 100, 1),
-        "device":         "Demo Mode",
+        "prob_normal":     round(probs[0] * 100, 1),
+        "prob_hyper":      round(probs[1] * 100, 1),
+        "prob_hypo":       round(probs[2] * 100, 1),
+        "device":          "Demo Mode",
     }
 
 
@@ -665,19 +666,30 @@ def gradcam_explain(
     bh = target_layer.register_full_backward_hook(_bwd_hook)
 
     try:
-        model.eval()
-        tensor = _rgb_nhwc_to_model_input(image_array)
+        with torch.enable_grad():
+            tensor = _rgb_nhwc_to_model_input(image_array)
+            tensor.requires_grad = True
 
-        output = model(tensor)
+            model.eval()
+            output = model(tensor)
+
+            model.zero_grad()
+            score = output[0, target_idx]
+            score.backward()
+
+            grads = gradients[0]
+            acts  = activations[0]
+
+            if grads is None or acts is None:
+                return None, features
+
+            weights = grads.mean(dim=(2, 3), keepdim=True)
+            cam     = torch.relu((weights * acts).sum(dim=1)).squeeze()
+            cam_np  = cam.detach().cpu().numpy()
+
+        del output, score, grads, acts, tensor
         model.zero_grad()
-        output[0, target_idx].backward()
-
-        grads = gradients[0]
-        acts  = activations[0]
-
-        weights = grads.mean(dim=(2, 3), keepdim=True)
-        cam     = torch.relu((weights * acts).sum(dim=1)).squeeze()
-        cam_np  = cam.detach().cpu().numpy()
+        gc.collect()
 
         cam_min, cam_max = cam_np.min(), cam_np.max()
         if cam_max > cam_min:
@@ -697,7 +709,7 @@ def gradcam_explain(
         overlay_np   = cv2.addWeighted(original_rgb, 0.55, heatmap_rgb, 0.45, 0)
         overlay_pil  = Image.fromarray(overlay_np)
 
-        logger.info(f"Grad-CAM computed for class={target_idx} ({verdict})")
+        logger.info(f"Grad-CAM computed cleanly for class={target_idx} ({verdict})")
         return overlay_pil, features
 
     except Exception as exc:
@@ -708,3 +720,4 @@ def gradcam_explain(
     finally:
         fh.remove()
         bh.remove()
+        gc.collect()
