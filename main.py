@@ -6,6 +6,7 @@ Architecture: timm tf_efficientnet_b4_ns + 2-layer custom head
 """
 
 import io
+import gc
 import base64
 import logging
 import traceback
@@ -159,6 +160,8 @@ async def predict_endpoint(
     except Exception:
         logger.error(f"/predict inference:\n{traceback.format_exc()}")
         raise HTTPException(500, "Model inference failed.")
+    finally:
+        gc.collect()
 
     logger.info(f"verdict={result['verdict']} conf={result['confidence_pct']}%")
     return _build_result_response(
@@ -204,6 +207,8 @@ async def predict_12lead_single_endpoint(
     except Exception:
         logger.error(f"/predict-12lead-single inference:\n{traceback.format_exc()}")
         raise HTTPException(500, "Model inference failed.")
+    finally:
+        gc.collect()
 
     logger.info(f"12lead-single verdict={result['verdict']} conf={result['confidence_pct']}%")
     return _build_result_response(
@@ -244,6 +249,8 @@ async def reprocess_endpoint(
     except Exception:
         logger.error(f"/reprocess:\n{traceback.format_exc()}")
         raise HTTPException(500, "Reprocessing failed.")
+    finally:
+        gc.collect()
 
     return {"processed_image": processed_b64}
 
@@ -270,6 +277,8 @@ async def reprocess_12lead_single_endpoint(
     except Exception:
         logger.error(f"/reprocess-12lead-single:\n{traceback.format_exc()}")
         raise HTTPException(500, "12-lead single reprocessing failed.")
+    finally:
+        gc.collect()
 
     return {"processed_image": processed_b64}
 
@@ -297,10 +306,10 @@ async def explain_endpoint(
         else:
             inp_array, _, _, _ = full_preprocess(img, waveform_threshold=thresh)
 
-        with torch.no_grad():
-            overlay_pil, features = gradcam_explain(
-                MODEL_INSTANCE, inp_array, verdict=verdict
-            )
+        # Grad-CAM requires backpropagation enabled during pass
+        overlay_pil, features = gradcam_explain(
+            MODEL_INSTANCE, inp_array, verdict=verdict
+        )
 
         heatmap_b64 = _pil_to_b64(overlay_pil) if overlay_pil is not None else None
 
@@ -317,6 +326,8 @@ async def explain_endpoint(
             "features":      get_ecg_features(verdict),
             "verdict":       verdict,
         }
+    finally:
+        gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
