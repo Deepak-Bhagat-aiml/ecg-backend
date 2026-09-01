@@ -312,7 +312,6 @@ async def explain_endpoint(
         )
 
         heatmap_b64 = _pil_to_b64(overlay_pil) if overlay_pil is not None else None
-
         return {
             "heatmap_image": heatmap_b64,
             "features":      features,
