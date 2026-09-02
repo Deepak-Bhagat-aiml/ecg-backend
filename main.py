@@ -47,12 +47,36 @@ app = FastAPI(title="ECG Potassium Analyzer API", version="3.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "OPTIONS", "HEAD"],
     allow_headers=["*"],
 )
 
 # Global model instance cached in RAM
 MODEL_INSTANCE = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ROOT / HEALTH CHECK ENDPOINTS (Fixes Render 502 Bad Gateway)
+# ─────────────────────────────────────────────────────────────────────────────
+@app.get("/")
+@app.head("/")
+async def root_health_check():
+    """Root endpoint for Render health pings to prevent 502 Bad Gateway."""
+    return {
+        "status": "online",
+        "message": "ECG Potassium Analyzer Backend API is running.",
+        "model_status": "loaded" if MODEL_INSTANCE is not None else "demo_mode",
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "ok",
+        "model": "loaded" if MODEL_INSTANCE is not None else "demo",
+        "backend": "EfficientNetB4ECG — timm tf_efficientnet_b4_ns (PyTorch)",
+    }
+
 
 @app.on_event("startup")
 async def startup_event():
@@ -68,20 +92,30 @@ async def startup_event():
     else:
         logger.info("✅  EfficientNetB4ECG (timm tf_efficientnet_b4_ns) ready.")
 
-# UTILITIES
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
 def _pil_to_b64(img: Image.Image) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
 
+
 def _read_upload(upload: UploadFile, raw_bytes: bytes) -> Image.Image:
     allowed = {
-        "image/jpeg", "image/jpg", "image/png",
-        "image/bmp", "image/tiff", "image/webp",
+        "image/jpeg",
+        "image/jpg",
+        "image/png",
+        "image/bmp",
+        "image/tiff",
+        "image/webp",
     }
     ct = (upload.content_type or "").lower()
     if ct and ct not in allowed:
-        raise HTTPException(400, f"Unsupported type '{ct}'. Please send PNG/JPEG/BMP/TIFF.")
+        raise HTTPException(
+            400, f"Unsupported type '{ct}'. Please send PNG/JPEG/BMP/TIFF."
+        )
     if not raw_bytes:
         raise HTTPException(400, "Empty file received.")
     try:
@@ -89,35 +123,41 @@ def _read_upload(upload: UploadFile, raw_bytes: bytes) -> Image.Image:
     except Exception as exc:
         raise HTTPException(400, f"Could not open image: {exc}")
 
+
 def _clamp_thresh(value: int) -> int:
     return max(40, min(130, value))
 
+
 def _build_result_response(result: dict, **extra) -> dict:
     return {
-        "verdict":         result["verdict"],
-        "confidence_pct":  result["confidence_pct"],
-        "prob_normal":     result["prob_normal"],
-        "prob_hyper":      result["prob_hyper"],
-        "prob_hypo":       result["prob_hypo"],
-        "device":          result["device"],
-        "entropy_pct":     result.get("entropy_pct", 0.0),
+        "verdict": result["verdict"],
+        "confidence_pct": result["confidence_pct"],
+        "prob_normal": result["prob_normal"],
+        "prob_hyper": result["prob_hyper"],
+        "prob_hypo": result["prob_hypo"],
+        "device": result["device"],
+        "entropy_pct": result.get("entropy_pct", 0.0),
         **extra,
     }
 
+
 def _preprocess_single_12lead(img: Image.Image, thresh: int):
-    enhanced    = enhance_ecg_waveform(img)
+    enhanced = enhance_ecg_waveform(img)
     cleaned_pil = remove_ecg_grid(enhanced, thresh)
-    inp_array   = stack_and_resize_leads([cleaned_pil])
+    inp_array = stack_and_resize_leads([cleaned_pil])
     return inp_array, cleaned_pil
 
-# /health
-@app.get("/health")
-async def health_check():
-    return {
-        "status":  "ok",
-        "model":   "loaded" if MODEL_INSTANCE is not None else "demo",
-        "backend": "EfficientNetB4ECG — timm tf_efficientnet_b4_ns (PyTorch)",
-    }
+
+def _free_memory():
+    """Aggressive memory cleanup context helper."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  API ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
 
 # /predict — Clean ECG mode
 @app.post("/predict")
@@ -132,7 +172,7 @@ async def predict_endpoint(
     except Exception:
         raise HTTPException(400, "Failed to read uploaded file.")
 
-    img    = _read_upload(file, raw_bytes)
+    img = _read_upload(file, raw_bytes)
     thresh = _clamp_thresh(waveform_threshold)
 
     try:
@@ -141,15 +181,17 @@ async def predict_endpoint(
         )
     except Exception:
         logger.error(f"/predict preprocess:\n{traceback.format_exc()}")
-        raise HTTPException(500, "Preprocessing failed. Please try with a cleaner ECG image.")
+        raise HTTPException(
+            500, "Preprocessing failed. Please try with a cleaner ECG image."
+        )
 
     processed_b64 = None
     try:
         if has_red_grid or is_12lead:
-            enhanced  = enhance_ecg_waveform(img)
-            proc_pil  = remove_ecg_grid(enhanced, thresh)
+            enhanced = enhance_ecg_waveform(img)
+            proc_pil = remove_ecg_grid(enhanced, thresh)
         else:
-            proc_pil  = img
+            proc_pil = img
         processed_b64 = _pil_to_b64(proc_pil)
     except Exception:
         logger.warning(f"Preview build failed:\n{traceback.format_exc()}")
@@ -161,16 +203,17 @@ async def predict_endpoint(
         logger.error(f"/predict inference:\n{traceback.format_exc()}")
         raise HTTPException(500, "Model inference failed.")
     finally:
-        gc.collect()
+        _free_memory()
 
     logger.info(f"verdict={result['verdict']} conf={result['confidence_pct']}%")
     return _build_result_response(
         result,
-        is_12lead       = is_12lead,
-        has_red_grid    = has_red_grid,
-        is_blurry       = is_blurry,
-        processed_image = processed_b64,
+        is_12lead=is_12lead,
+        has_red_grid=has_red_grid,
+        is_blurry=is_blurry,
+        processed_image=processed_b64,
     )
+
 
 # /predict-12lead-single
 @app.post("/predict-12lead-single")
@@ -185,7 +228,7 @@ async def predict_12lead_single_endpoint(
     except Exception:
         raise HTTPException(400, "Failed to read uploaded file.")
 
-    img    = _read_upload(file, raw_bytes)
+    img = _read_upload(file, raw_bytes)
     thresh = _clamp_thresh(waveform_threshold)
 
     try:
@@ -196,7 +239,7 @@ async def predict_12lead_single_endpoint(
 
     processed_b64 = None
     try:
-        recon_pil     = Image.fromarray(inp_array[0].astype(np.uint8))
+        recon_pil = Image.fromarray(inp_array[0].astype(np.uint8))
         processed_b64 = _pil_to_b64(recon_pil)
     except Exception:
         logger.warning(f"12lead-single preview failed:\n{traceback.format_exc()}")
@@ -208,16 +251,19 @@ async def predict_12lead_single_endpoint(
         logger.error(f"/predict-12lead-single inference:\n{traceback.format_exc()}")
         raise HTTPException(500, "Model inference failed.")
     finally:
-        gc.collect()
+        _free_memory()
 
-    logger.info(f"12lead-single verdict={result['verdict']} conf={result['confidence_pct']}%")
+    logger.info(
+        f"12lead-single verdict={result['verdict']} conf={result['confidence_pct']}%"
+    )
     return _build_result_response(
         result,
-        is_12lead       = True,
-        has_red_grid    = True,
-        is_blurry       = False,
-        processed_image = processed_b64,
+        is_12lead=True,
+        has_red_grid=True,
+        is_blurry=False,
+        processed_image=processed_b64,
     )
+
 
 # /reprocess — Live threshold preview (Clean ECG)
 @app.post("/reprocess")
@@ -232,16 +278,16 @@ async def reprocess_endpoint(
     except Exception:
         raise HTTPException(400, "Failed to read uploaded file.")
 
-    img    = _read_upload(file, raw_bytes)
+    img = _read_upload(file, raw_bytes)
     thresh = _clamp_thresh(waveform_threshold)
 
     try:
         has_red_grid = detect_red_grid(img)
-        is_12lead    = detect_12lead(img)
+        is_12lead = detect_12lead(img)
 
         if has_red_grid or is_12lead:
-            enhanced  = enhance_ecg_waveform(img)
-            proc_pil  = remove_ecg_grid(enhanced, thresh)
+            enhanced = enhance_ecg_waveform(img)
+            proc_pil = remove_ecg_grid(enhanced, thresh)
         else:
             proc_pil = img
 
@@ -250,9 +296,10 @@ async def reprocess_endpoint(
         logger.error(f"/reprocess:\n{traceback.format_exc()}")
         raise HTTPException(500, "Reprocessing failed.")
     finally:
-        gc.collect()
+        _free_memory()
 
     return {"processed_image": processed_b64}
+
 
 # /reprocess-12lead-single — Live threshold preview (12-lead)
 @app.post("/reprocess-12lead-single")
@@ -267,20 +314,21 @@ async def reprocess_12lead_single_endpoint(
     except Exception:
         raise HTTPException(400, "Failed to read uploaded file.")
 
-    img    = _read_upload(file, raw_bytes)
+    img = _read_upload(file, raw_bytes)
     thresh = _clamp_thresh(waveform_threshold)
 
     try:
-        inp_array, _  = _preprocess_single_12lead(img, thresh)
-        recon_pil     = Image.fromarray(inp_array[0].astype(np.uint8))
+        inp_array, _ = _preprocess_single_12lead(img, thresh)
+        recon_pil = Image.fromarray(inp_array[0].astype(np.uint8))
         processed_b64 = _pil_to_b64(recon_pil)
     except Exception:
         logger.error(f"/reprocess-12lead-single:\n{traceback.format_exc()}")
         raise HTTPException(500, "12-lead single reprocessing failed.")
     finally:
-        gc.collect()
+        _free_memory()
 
     return {"processed_image": processed_b64}
+
 
 # /explain — Explainable AI: Grad-CAM + ECG wave features
 @app.post("/explain")
@@ -290,14 +338,16 @@ async def explain_endpoint(
     verdict: str = Form("Normal"),
     is_12lead: bool = Form(False),
 ):
-    logger.info(f"/explain | verdict={verdict!r} thresh={waveform_threshold} is_12lead={is_12lead}")
+    logger.info(
+        f"/explain | verdict={verdict!r} thresh={waveform_threshold} is_12lead={is_12lead}"
+    )
 
     try:
         raw_bytes = await file.read()
     except Exception:
         raise HTTPException(400, "Failed to read uploaded file.")
 
-    img    = _read_upload(file, raw_bytes)
+    img = _read_upload(file, raw_bytes)
     thresh = _clamp_thresh(waveform_threshold)
 
     try:
@@ -306,7 +356,7 @@ async def explain_endpoint(
         else:
             inp_array, _, _, _ = full_preprocess(img, waveform_threshold=thresh)
 
-        # Grad-CAM requires backpropagation enabled during pass
+        # Grad-CAM call (Option A memory-safe implementation)
         overlay_pil, features = gradcam_explain(
             MODEL_INSTANCE, inp_array, verdict=verdict
         )
@@ -314,20 +364,22 @@ async def explain_endpoint(
         heatmap_b64 = _pil_to_b64(overlay_pil) if overlay_pil is not None else None
         return {
             "heatmap_image": heatmap_b64,
-            "features":      features,
-            "verdict":       verdict,
+            "features": features,
+            "verdict": verdict,
         }
 
     except Exception:
         logger.error(f"/explain:\n{traceback.format_exc()}")
         return {
             "heatmap_image": None,
-            "features":      get_ecg_features(verdict),
-            "verdict":       verdict,
+            "features": get_ecg_features(verdict),
+            "verdict": verdict,
         }
     finally:
-        gc.collect()
+        _free_memory()
+
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
