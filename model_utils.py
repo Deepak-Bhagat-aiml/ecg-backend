@@ -12,12 +12,8 @@ Preprocessing pipeline (matches Streamlit training pipeline exactly):
   Mode 1 — Clean ECG   : resize 512×576 → model
   Mode 2 — 12-Lead ECG : enhance → grid removal → stack → model
 
-WAVEFORM THRESHOLD SLIDER:
-  remove_ecg_grid(img, waveform_threshold=80) accepts threshold param.
-  full_preprocess() + predict pipeline all honour it.
-
-EXPLAINABLE AI (v3.1):
-  gradcam_explain() — Grad-CAM on backbone.conv_head + colour overlay
+EXPLAINABLE AI (v3.1 - Cloud Memory Optimized):
+  gradcam_explain() — Memory-safe fallback for Render 512MB RAM tier
   get_ecg_features() — rule-based ECG wave findings per verdict
 """
 
@@ -69,10 +65,7 @@ try:
 except ImportError:
     HAS_TIMM = False
     timm = None
-    logger.warning(
-        "timm not installed — install with: pip install timm\n"
-        "Model cannot be loaded without timm. DEMO MODE will be used."
-    )
+    logger.warning("timm not installed — DEMO MODE will be used.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,13 +133,8 @@ def load_model():
     if _model_cache is not None:
         return _model_cache
 
-    if not HAS_TORCH:
-        logger.warning("PyTorch not installed — DEMO MODE.")
-        _model_cache = _DEMO_SENTINEL
-        return None
-
-    if not HAS_TIMM:
-        logger.warning("timm not installed — DEMO MODE.")
+    if not HAS_TORCH or not HAS_TIMM:
+        logger.warning("Dependencies missing — DEMO MODE.")
         _model_cache = _DEMO_SENTINEL
         return None
 
@@ -164,7 +152,6 @@ def load_model():
     if not os.path.isabs(model_path):
         model_path = os.path.join(script_dir, model_path)
 
-    print(f"[model_utils] Loading model from: {model_path}")
     logger.info(f"Model path resolved: {model_path}")
 
     if not os.path.exists(model_path):
@@ -214,10 +201,6 @@ def load_model():
         logger.info(f"✅ EfficientNetB4ECG loaded: {model_path} | classes={num_classes}")
         return model
 
-    except RuntimeError as exc:
-        logger.error(f"Model load FAILED — architecture mismatch: {exc}")
-        _model_cache = _DEMO_SENTINEL
-        return None
     except Exception as exc:
         logger.error(f"Model load failed: {exc}")
         _model_cache = _DEMO_SENTINEL
@@ -225,7 +208,7 @@ def load_model():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  AUTO-DETECTION
+#  AUTO-DETECTION & PREPROCESSING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def detect_red_grid(img: Image.Image) -> bool:
@@ -248,19 +231,11 @@ def detect_12lead(img: Image.Image) -> bool:
     return ratio > 1.3
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  PREPROCESSING — MODE 1 (Clean ECG)
-# ─────────────────────────────────────────────────────────────────────────────
-
 def preprocess_clean_ecg(img: Image.Image) -> np.ndarray:
     resized = img.convert("RGB").resize((TARGET_W, TARGET_H), Image.LANCZOS)
     arr     = np.array(resized, dtype=np.float32)
     return np.expand_dims(arr, axis=0)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  PREPROCESSING — MODE 2 (12-Lead ECG)
-# ─────────────────────────────────────────────────────────────────────────────
 
 def enhance_ecg_waveform(img: Image.Image) -> Image.Image:
     enhanced  = ImageEnhance.Contrast(img.convert("RGB")).enhance(1.8)
@@ -325,10 +300,6 @@ def stack_and_resize_leads(leads: list) -> np.ndarray:
     arr   = np.array(final, dtype=np.float32)
     return np.expand_dims(arr, axis=0)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  FULL PREPROCESSING PIPELINE
-# ─────────────────────────────────────────────────────────────────────────────
 
 def full_preprocess(
     img: Image.Image,
@@ -473,15 +444,10 @@ def pil_to_bytes(img: Image.Image, fmt: str = "PNG") -> bytes:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  EXPLAINABLE AI — ECG WAVE FEATURES  (rule-based per verdict)
+#  EXPLAINABLE AI — ECG WAVE FEATURES
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_ecg_features(verdict: str) -> list:
-    """
-    Returns a list of ECG wave findings that explain the predicted verdict.
-    Each item: { wave, finding, severity, detail }
-    severity: "normal" | "low" | "medium" | "high"
-    """
     FEATURES = {
         "Normal": [
             {
@@ -622,7 +588,7 @@ def get_ecg_features(verdict: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  EXPLAINABLE AI — GRAD-CAM HEATMAP
+#  EXPLAINABLE AI — OPTION A: MEMORY SAFE GRAD-CAM
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gradcam_explain(
@@ -631,93 +597,10 @@ def gradcam_explain(
     verdict: str = "Normal",
 ):
     """
-    Compute Grad-CAM activation map over the last convolutional layer of
-    EfficientNetB4ECG (backbone.conv_head) and overlay it on the input image.
-
-    Args:
-        model       — loaded EfficientNetB4ECG (or None for demo mode)
-        image_array — (1, H, W, 3) float32 RGB, same array passed to predict()
-        verdict     — predicted verdict string, used to select target class
-
-    Returns:
-        overlay_pil — PIL Image with heatmap overlay (None on failure / demo mode)
-        features    — list of ECG wave feature dicts from get_ecg_features()
+    Option A Optimization:
+    Bypasses PyTorch backpropagation to keep peak memory usage under 250MB 
+    on Render 512MB RAM tier, returning rule-based clinical features cleanly.
     """
     features = get_ecg_features(verdict)
-
-    if not HAS_TORCH or model is None:
-        logger.info("Grad-CAM skipped (demo mode or torch missing) — returning features only.")
-        return None, features
-
-    CLASS_MAP  = {"Normal": 0, "Hyperkalemia": 1, "Hypokalemia": 2, "Inconclusive": 0}
-    target_idx = CLASS_MAP.get(verdict, 0)
-
-    activations: list = [None]
-    gradients:   list = [None]
-
-    def _fwd_hook(_module, _inp, out):
-        activations[0] = out
-
-    def _bwd_hook(_module, _grad_in, grad_out):
-        gradients[0] = grad_out[0]
-
-    target_layer = model.backbone.conv_head
-    fh = target_layer.register_forward_hook(_fwd_hook)
-    bh = target_layer.register_full_backward_hook(_bwd_hook)
-
-    try:
-        with torch.enable_grad():
-            tensor = _rgb_nhwc_to_model_input(image_array)
-            tensor.requires_grad = True
-
-            model.eval()
-            output = model(tensor)
-
-            model.zero_grad()
-            score = output[0, target_idx]
-            score.backward()
-
-            grads = gradients[0]
-            acts  = activations[0]
-
-            if grads is None or acts is None:
-                return None, features
-
-            weights = grads.mean(dim=(2, 3), keepdim=True)
-            cam     = torch.relu((weights * acts).sum(dim=1)).squeeze()
-            cam_np  = cam.detach().cpu().numpy()
-
-        del output, score, grads, acts, tensor
-        model.zero_grad()
-        gc.collect()
-
-        cam_min, cam_max = cam_np.min(), cam_np.max()
-        if cam_max > cam_min:
-            cam_np = (cam_np - cam_min) / (cam_max - cam_min)
-        else:
-            cam_np = np.zeros_like(cam_np)
-
-        H, W   = int(image_array.shape[1]), int(image_array.shape[2])
-        cam_up = cv2.resize(cam_np, (W, H), interpolation=cv2.INTER_CUBIC)
-        cam_up = np.clip(cam_up, 0.0, 1.0)
-
-        heatmap_u8  = (cam_up * 255).astype(np.uint8)
-        heatmap_bgr = cv2.applyColorMap(heatmap_u8, cv2.COLORMAP_JET)
-        heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
-
-        original_rgb = image_array[0].astype(np.uint8)
-        overlay_np   = cv2.addWeighted(original_rgb, 0.55, heatmap_rgb, 0.45, 0)
-        overlay_pil  = Image.fromarray(overlay_np)
-
-        logger.info(f"Grad-CAM computed cleanly for class={target_idx} ({verdict})")
-        return overlay_pil, features
-
-    except Exception as exc:
-        import traceback
-        logger.error(f"Grad-CAM failed: {exc}\n{traceback.format_exc()}")
-        return None, features
-
-    finally:
-        fh.remove()
-        bh.remove()
-        gc.collect()
+    logger.info("Grad-CAM backprop disabled (Option A active for cloud RAM safety).")
+    return None, features
