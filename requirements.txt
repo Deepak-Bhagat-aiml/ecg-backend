@@ -1,9 +1,9 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchvision
+--find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
 timm
 fastapi
 uvicorn
-opencv-python-headless
-pillow
 python-multipart
+Pillow
+numpy
